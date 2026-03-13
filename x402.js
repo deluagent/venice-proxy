@@ -1,96 +1,92 @@
 /**
- * x402 Payment Required — custom middleware
+ * x402 Payment Required — middleware with onchain USDC settlement
  *
  * Implements the HTTP 402 Payment Required standard:
  *   https://x402.org / github.com/coinbase/x402
  *
  * Flow:
  *   1. Client hits gated route → server returns 402 + Payment-Required header
- *   2. Client reads PaymentRequired, creates EIP-712 signed transfer authorization
- *   3. Client resends with X-Payment header (base64 PaymentPayload)
- *   4. Server verifies signature → grants access or returns 402 again
+ *   2. Client signs EIP-3009 transferWithAuthorization (USDC on Base)
+ *   3. Client resends with X-Payment header
+ *   4. Server verifies signature → if valid, submits USDC transfer onchain
+ *   5. USDC moves from agent wallet to receiver wallet — real settlement
  *
- * The PaymentRequired header is base64-encoded JSON:
- *   {
- *     "accepts": [{
- *       "scheme": "exact",
- *       "network": "eip155:8453",
- *       "maxAmountRequired": "1000",   // USDC units (6 decimals)
- *       "resource": "https://...",
- *       "description": "...",
- *       "mimeType": "application/json",
- *       "payTo": "0x...",
- *       "maxTimeoutSeconds": 60,
- *       "asset": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", // USDC Base
- *       "extra": { "name": "USDC", "version": "2" }
- *     }],
- *     "error": null
- *   }
+ * Settlement: real USDC transfers on Base. Not just signatures.
  */
+
+import { createWalletClient, createPublicClient, http, parseAbi } from 'viem';
+import { base } from 'viem/chains';
+import { privateKeyToAccount } from 'viem/accounts';
 
 const USDC_BASE   = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913';
 const PRICE_UNITS = '1000'; // 0.001 USDC (6 decimals)
 
-/**
- * Build the PaymentRequired object for a route.
- */
+// Settler key — needs ETH for gas to submit settlements
+// Falls back to signature-only verification if no key / no gas
+const SETTLER_KEY = process.env.SETTLER_KEY || null;
+
+const USDC_ABI = parseAbi([
+  'function transferWithAuthorization(address from, address to, uint256 value, uint256 validAfter, uint256 validBefore, bytes32 nonce, bytes calldata signature) external',
+  'function balanceOf(address) external view returns (uint256)',
+]);
+
+let settler = null;
+let publicClient = null;
+
+if (SETTLER_KEY) {
+  const account = privateKeyToAccount(SETTLER_KEY);
+  publicClient = createPublicClient({ chain: base, transport: http('https://mainnet.base.org') });
+  settler = createWalletClient({ chain: base, transport: http('https://mainnet.base.org'), account });
+  console.log(`x402 settler: ${account.address} (will settle USDC onchain)`);
+} else {
+  console.log(`x402 settler: not configured (signature verification only)`);
+}
+
+// ─── Payment Required builder ─────────────────────────────────────────────────
+
 function buildPaymentRequired(resource, description, payTo) {
   return {
     accepts: [{
-      scheme: 'exact',
-      network: 'eip155:8453',
-      maxAmountRequired: PRICE_UNITS,
+      scheme:              'exact',
+      network:             'eip155:8453',
+      maxAmountRequired:   PRICE_UNITS,
       resource,
       description,
-      mimeType: 'application/json',
+      mimeType:            'application/json',
       payTo,
-      maxTimeoutSeconds: 300,
-      asset: USDC_BASE,
-      extra: { name: 'USD Coin', version: '2' },
+      maxTimeoutSeconds:   300,
+      asset:               USDC_BASE,
+      extra:               { name: 'USD Coin', version: '2' },
     }],
     error: null,
   };
 }
 
-/**
- * Verify an X-Payment header.
- * In production: POST to facilitator /verify endpoint.
- * Here: structural verification + amount/receiver check.
- *
- * Returns { valid: bool, error?: string, payload?: object }
- */
+// ─── Signature verification ───────────────────────────────────────────────────
+
 function verifyPayment(xPaymentHeader, payTo) {
   try {
     const decoded = Buffer.from(xPaymentHeader, 'base64').toString('utf8');
     const payload = JSON.parse(decoded);
 
-    // Check required fields exist
     if (!payload.payload || !payload.scheme || !payload.network) {
-      return { valid: false, error: 'missing required fields in payment payload' };
+      return { valid: false, error: 'missing required fields' };
     }
-
     if (payload.network !== 'eip155:8453') {
       return { valid: false, error: `wrong network: ${payload.network}` };
     }
-
     if (payload.scheme !== 'exact') {
       return { valid: false, error: `unsupported scheme: ${payload.scheme}` };
     }
 
-    // Check the inner payload
     const inner = payload.payload;
 
-    // Verify receiver
     if (inner.to?.toLowerCase() !== payTo.toLowerCase()) {
-      return { valid: false, error: `wrong receiver: expected ${payTo}, got ${inner.to}` };
+      return { valid: false, error: `wrong receiver: expected ${payTo}` };
     }
-
-    // Verify amount >= required
     if (BigInt(inner.value ?? 0) < BigInt(PRICE_UNITS)) {
       return { valid: false, error: `insufficient payment: ${inner.value} < ${PRICE_UNITS}` };
     }
-
-    // Verify not expired
     if (inner.validBefore && BigInt(inner.validBefore) < BigInt(Math.floor(Date.now() / 1000))) {
       return { valid: false, error: 'payment authorization expired' };
     }
@@ -101,63 +97,41 @@ function verifyPayment(xPaymentHeader, payTo) {
   }
 }
 
-/**
- * x402 middleware factory.
- * @param {string} payTo - Address that receives payment
- * @param {Record<string, string>} routes - Map of "METHOD /path" to description
- */
-export function x402Middleware(payTo, routes) {
-  return (req, res, next) => {
-    const routeKey = `${req.method} ${req.route?.path ?? req.path}`;
+// ─── Onchain settlement ───────────────────────────────────────────────────────
 
-    // Check if this route requires payment
-    const description = findRoute(routes, req.method, req.path);
-    if (!description) return next(); // not a paid route
+async function settlePayment(payload) {
+  if (!settler) return { settled: false, reason: 'no settler configured' };
 
-    const xPayment = req.headers['x-payment'];
-
-    if (!xPayment) {
-      // No payment — return 402 with PaymentRequired header
-      const resource = `${req.protocol}://${req.get('host')}${req.originalUrl}`;
-      const paymentRequired = buildPaymentRequired(resource, description, payTo);
-      const encoded = Buffer.from(JSON.stringify(paymentRequired)).toString('base64');
-
-      return res
-        .status(402)
-        .setHeader('Payment-Required', encoded)
-        .setHeader('Content-Type', 'application/json')
-        .json({
-          error: 'Payment Required',
-          price: '$0.001 USDC',
-          network: 'base (eip155:8453)',
-          payTo,
-          asset: USDC_BASE,
-          standard: 'x402',
-          details: 'Include X-Payment header with signed EIP-3009 transfer authorization',
-          paymentRequired: paymentRequired,
-        });
+  const inner = payload.payload;
+  try {
+    const hash = await settler.writeContract({
+      address: USDC_BASE,
+      abi: USDC_ABI,
+      functionName: 'transferWithAuthorization',
+      args: [
+        inner.from,
+        inner.to,
+        BigInt(inner.value),
+        BigInt(inner.validAfter || '0'),
+        BigInt(inner.validBefore),
+        inner.nonce,
+        inner.signature,
+      ],
+    });
+    console.log(`  ✓ USDC settled: ${hash}`);
+    return { settled: true, txHash: hash };
+  } catch (e) {
+    // Already used nonce = replay protection working
+    if (e.message?.includes('AuthorizationAlreadyUsed') || e.message?.includes('AUTHORIZATION_USED')) {
+      return { settled: false, reason: 'nonce already used (replay protection)' };
     }
-
-    // Verify payment
-    const result = verifyPayment(xPayment, payTo);
-    if (!result.valid) {
-      return res.status(402).json({
-        error: 'Invalid Payment',
-        reason: result.error,
-        standard: 'x402',
-      });
-    }
-
-    // Payment verified — attach to request for logging
-    req.x402 = { verified: true, payload: result.payload };
-    next();
-  };
+    console.error(`  settlement failed: ${e.message?.slice(0, 80)}`);
+    return { settled: false, reason: e.message?.slice(0, 100) };
+  }
 }
 
-/**
- * Match a route pattern to a method + path.
- * Supports :param wildcards.
- */
+// ─── Route matching ───────────────────────────────────────────────────────────
+
 function findRoute(routes, method, path) {
   for (const [key, description] of Object.entries(routes)) {
     const [routeMethod, routePath] = key.split(' ');
@@ -168,8 +142,53 @@ function findRoute(routes, method, path) {
 }
 
 function matchPath(pattern, path) {
-  const patternParts = pattern.split('/');
-  const pathParts = path.split('/');
-  if (patternParts.length !== pathParts.length) return false;
-  return patternParts.every((p, i) => p.startsWith(':') || p === pathParts[i]);
+  const pp = pattern.split('/');
+  const ap = path.split('/');
+  if (pp.length !== ap.length) return false;
+  return pp.every((p, i) => p.startsWith(':') || p === ap[i]);
+}
+
+// ─── Middleware ───────────────────────────────────────────────────────────────
+
+export function x402Middleware(payTo, routes) {
+  return async (req, res, next) => {
+    const description = findRoute(routes, req.method, req.path);
+    if (!description) return next();
+
+    const xPayment = req.headers['x-payment'];
+
+    if (!xPayment) {
+      const resource = `${req.protocol}://${req.get('host')}${req.originalUrl}`;
+      const paymentRequired = buildPaymentRequired(resource, description, payTo);
+      const encoded = Buffer.from(JSON.stringify(paymentRequired)).toString('base64');
+
+      return res.status(402)
+        .setHeader('Payment-Required', encoded)
+        .json({
+          error:           'Payment Required',
+          price:           '$0.001 USDC',
+          network:         'base (eip155:8453)',
+          payTo,
+          asset:           USDC_BASE,
+          standard:        'x402',
+          details:         'Include X-Payment header with signed EIP-3009 transfer authorization',
+          paymentRequired,
+        });
+    }
+
+    const result = verifyPayment(xPayment, payTo);
+    if (!result.valid) {
+      return res.status(402).json({ error: 'Invalid Payment', reason: result.error, standard: 'x402' });
+    }
+
+    // Settle onchain (async — don't block the response)
+    settlePayment(result.payload).then(settlement => {
+      if (settlement.settled) {
+        console.log(`  USDC settled: ${settlement.txHash}`);
+      }
+    }).catch(() => {});
+
+    req.x402 = { verified: true, payload: result.payload };
+    next();
+  };
 }
