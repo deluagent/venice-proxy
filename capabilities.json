@@ -1,0 +1,21 @@
+{
+  "name": "VeniceProxy",
+  "description": "Privacy-preserving AI inference via Venice AI. No data retention. $0.001 USDC per call via x402.",
+  "version": "1.0.0",
+  "paymentStandard": "x402",
+  "pricePerCall": "$0.001 USDC",
+  "network": "base",
+  "chainId": 8453,
+  "serviceRegistryId": 2,
+  "category": "AI",
+  "upstream": "https://api.venice.ai/api/v1",
+  "privacy": "no data retention, on-device inference, permissionless",
+  "openaiCompatible": true,
+  "models": ["llama-3.3-70b", "mistral-31-24b", "venice-uncensored", "qwen-2.5-vl"],
+  "endpoints": [
+    { "path": "/v1/chat/completions", "method": "POST", "description": "Chat completion (OpenAI-compatible)", "price": "$0.001" },
+    { "path": "/v1/completions",      "method": "POST", "description": "Text completion", "price": "$0.001" },
+    { "path": "/v1/models",           "method": "GET",  "description": "List available models", "price": "$0.001" },
+    { "path": "/health",              "method": "GET",  "description": "Health check", "price": "free" }
+  ]
+}
