@@ -3,6 +3,8 @@
   "description": "Privacy-preserving AI inference via Venice AI. No data retention. $0.001 USDC per call via x402.",
   "version": "1.0.0",
   "paymentStandard": "x402",
+  "agentcash_compatible": true,
+  "x402_discovery": "/.well-known/x402",
   "pricePerCall": "$0.001 USDC",
   "network": "base",
   "chainId": 8453,
